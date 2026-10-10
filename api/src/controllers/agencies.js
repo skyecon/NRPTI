@@ -9,6 +9,138 @@ const queryActions = require('../utils/query-actions');
 const RECORD_TYPE = require('../utils/constants/record-type-enum');
 const defaultLog = require('../utils/logger')('record');
 
+let agencyCodeByName = new Map();
+let agencyResolverOperation = Promise.resolve();
+
+/**
+ * Serializes resolver refreshes and agency renames within this Node.js process.
+ * This is intentionally a single-replica guarantee; multi-replica deployments
+ * require a database-backed lock or equivalent cross-process coordination.
+ */
+async function withAgencyResolverLock(operation) {
+  const previousOperation = agencyResolverOperation;
+  let releaseLock;
+  agencyResolverOperation = new Promise(resolve => {
+    releaseLock = resolve;
+  });
+
+  await previousOperation;
+  try {
+    return await operation();
+  } finally {
+    releaseLock();
+  }
+}
+
+function buildAgencyCodeMap(agencyDocuments) {
+  const refreshedMap = new Map();
+
+  agencyDocuments.forEach(agency => {
+    if (
+      !agency ||
+      typeof agency.agencyName !== 'string' ||
+      agency.agencyName.trim().length === 0 ||
+      typeof agency.agencyCode !== 'string' ||
+      agency.agencyCode.trim().length === 0
+    ) {
+      throw new Error('Malformed ApplicationAgency mapping');
+    }
+
+    const existingCode = refreshedMap.get(agency.agencyName);
+    if (existingCode && existingCode !== agency.agencyCode) {
+      throw new Error(`Conflicting agency codes for display name: ${agency.agencyName}`);
+    }
+    refreshedMap.set(agency.agencyName, agency.agencyCode);
+  });
+
+  if (refreshedMap.size === 0) {
+    throw new Error('No ApplicationAgency mappings were found');
+  }
+
+  return refreshedMap;
+}
+
+async function loadAgencyCodeMap(collectionDB) {
+  const agencyDocuments = await collectionDB.find({ _schemaName: RECORD_TYPE.ApplicationAgency._schemaName }).toArray();
+  return buildAgencyCodeMap(agencyDocuments);
+}
+
+/**
+ * Atomically refreshes the synchronous agency resolver from the authoritative
+ * ApplicationAgency records. The previous map remains active if the database
+ * read fails.
+ *
+ * @param {Object} collectionDB MongoDB nrpti collection (injectable for tests)
+ * @returns {number} number of agency mappings loaded
+ */
+exports.refreshAgencyCodeMap = async function (collectionDB = mongoose.connection.db.collection('nrpti')) {
+  return withAgencyResolverLock(async () => {
+    const refreshedMap = await loadAgencyCodeMap(collectionDB);
+    agencyCodeByName = refreshedMap;
+    return agencyCodeByName.size;
+  });
+};
+
+/**
+ * Resolves the current display name to its stable agency code. Unknown names
+ * return null so publication logic continues to fail closed.
+ *
+ * @param {string} agencyName
+ * @returns {string|null}
+ */
+exports.getAgencyCodeFromName = function (agencyName) {
+  return agencyCodeByName.get(agencyName) || null;
+};
+
+async function renameAgency(collectionDB, agencyCode, agencyName) {
+  const agencyDocuments = await collectionDB.find({ _schemaName: RECORD_TYPE.ApplicationAgency._schemaName }).toArray();
+  const currentAgency = agencyDocuments.find(agency => agency.agencyCode === agencyCode);
+  if (!currentAgency) {
+    throw new Error(`Unknown agency code: ${agencyCode}`);
+  }
+
+  const updatedAgencyDocuments = agencyDocuments.map(agency =>
+    agency.agencyCode === agencyCode ? { ...agency, agencyName } : agency
+  );
+  buildAgencyCodeMap(updatedAgencyDocuments);
+
+  await collectionDB.findOneAndUpdate(
+    { agencyCode },
+    {
+      $set: { agencyName }
+    }
+  );
+
+  try {
+    const refreshedMap = await loadAgencyCodeMap(collectionDB);
+    if (refreshedMap.get(agencyName) !== agencyCode) {
+      throw new Error(`Agency rename was not persisted for code: ${agencyCode}`);
+    }
+    agencyCodeByName = refreshedMap;
+  } catch (refreshError) {
+    try {
+      await collectionDB.findOneAndUpdate(
+        { agencyCode },
+        {
+          $set: { agencyName: currentAgency.agencyName }
+        }
+      );
+      const restoredMap = await loadAgencyCodeMap(collectionDB);
+      if (restoredMap.get(currentAgency.agencyName) !== agencyCode) {
+        throw new Error(`Agency rename rollback was not persisted for code: ${agencyCode}`);
+      }
+      agencyCodeByName = restoredMap;
+    } catch (recoveryError) {
+      agencyCodeByName = new Map();
+      const resolverRecoveryError = new Error('Agency resolver recovery failed');
+      resolverRecoveryError.refreshError = refreshError;
+      resolverRecoveryError.recoveryError = recoveryError;
+      throw resolverRecoveryError;
+    }
+    throw refreshError;
+  }
+}
+
 /**
  * @async
  * @param {Object} args - Request arguments.
@@ -62,27 +194,19 @@ exports.publicGet = async function (args, res, next) {
  */
 exports.protectedPut = async function (args, res, next) {
   const db = mongoose.connection.db;
-  let promises = [];
+  const collectionDB = db.collection('nrpti');
   let result = null;
   let incomingObj = args.swagger.params.data.value;
   const agencies = incomingObj['agencies'];
-  if (agencies && agencies.length > 0) {
-    const agencyCode = agencies[0]['agencyCode'];
-    const agencyName = agencies[0]['agencyName'];
-    const collectionDB = db.collection('nrpti');
-    promises.push(
-      collectionDB.findOneAndUpdate(
-        { agencyCode: agencyCode },
-        {
-          $set: {
-            agencyName: agencyName
-          }
-        }
-      )
-    );
-  }
   try {
-    await Promise.all(promises);
+    await withAgencyResolverLock(async () => {
+      if (agencies && agencies.length > 0) {
+        await renameAgency(collectionDB, agencies[0]['agencyCode'], agencies[0]['agencyName']);
+      } else {
+        const refreshedMap = await loadAgencyCodeMap(collectionDB);
+        agencyCodeByName = refreshedMap;
+      }
+    });
     result = 'Success';
   } catch (error) {
     defaultLog.info(`protectedPut - agencies controller - error updating record: ${incomingObj}`);
@@ -92,78 +216,4 @@ exports.protectedPut = async function (args, res, next) {
   }
   queryActions.sendResponse(res, 200, result);
   next();
-};
-
-/**
- * gets the intermediate code (agencyCode) for the given agencyName
- * A synchronous version of getAgencyCodeFromName. Instead of using the db to lookup values,
- * this function uses some hardcoded constants.
- * This function was implemented as a temporary fix because the async version proved difficult to implement.
- * This should be replaced
- * @param {*} agencyName
- * @returns {string} agencyCode if matching code is found, else null
- */
-exports.getAgencyCodeFromNameBandaid = function (agencyName) {
-  const AGENCY_NAME_CODE_MAP = [
-    {
-      agencyCode: 'AGENCY_ALC',
-      agencyName: 'Agricultural Land Commission'
-    },
-    {
-      agencyCode: 'AGENCY_WF',
-      agencyName: 'BC Wildfire Service'
-    },
-    {
-      agencyCode: 'AGENCY_ENV_COS',
-      agencyName: 'Conservation Officer Service'
-    },
-    {
-      agencyCode: 'AGENCY_EAO',
-      agencyName: 'Environmental Assessment Office'
-    },
-    {
-      agencyCode: 'AGENCY_EMLI',
-      agencyName: 'Ministry of Energy Mines and Low Carbon Innovation'
-    },
-    {
-      agencyCode: 'AGENCY_ENV',
-      agencyName: 'Ministry of Environment and Climate Change Strategy'
-    },
-    {
-      agencyCode: 'AGENCY_ENV_BCPARKS',
-      agencyName: 'BC Parks'
-    },
-    {
-      agencyCode: 'AGENCY_OGC',
-      agencyName: 'BC Energy Regulator'
-    },
-    {
-      agencyCode: 'AGENCY_LNG',
-      agencyName: 'LNG Secretariat'
-    },
-    {
-      agencyCode: 'AGENCY_AGRI',
-      agencyName: 'Ministry of Agriculture and Food'
-    },
-    {
-      agencyCode: 'AGENCY_FLNRO',
-      agencyName: 'Ministry of Forests'
-    },
-    {
-      agencyCode: 'AGENCY_FLNR_NRO',
-      agencyName: 'Natural Resource Officers'
-    },
-    {
-      agencyCode: 'AGENCY_WLRS',
-      agencyName: 'Ministry of Water, Land and Resource Stewardship'
-    },
-    {
-      agencyCode: 'AGENCY_CAS',
-      agencyName: 'Climate Action Secretariat'
-    }
-  ];
-
-  const agency = AGENCY_NAME_CODE_MAP.find(agency => agency.agencyName === agencyName);
-
-  return agency ? agency.agencyCode : null; // if no matching code is found, return null
 };

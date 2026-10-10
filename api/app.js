@@ -127,6 +127,11 @@ swaggerTools.initializeMiddleware(swaggerConfig, async function (middleware) {
     // Load database models (from directory)
     require('./src/models');
 
+    // Load the authoritative agency-name resolver before accepting requests.
+    // Startup fails closed if agency identities cannot be loaded.
+    const agenciesController = require('./src/controllers/agencies');
+    await agenciesController.refreshAgencyCodeMap();
+
     // Start application
     app.listen(3000, '0.0.0.0', function () {
       defaultLog.info('Started server on port 3000');

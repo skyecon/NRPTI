@@ -123,7 +123,7 @@ function isIssuedToConsideredAnonymous(issuedTo, issuingAgency) {
     return false;
   }
 
-  const agencyCode = agenciesController.getAgencyCodeFromNameBandaid(issuingAgency);
+  const agencyCode = agenciesController.getAgencyCodeFromName(issuingAgency);
 
   // check if the issuingAgency has legislative authority to publish names
   if (
